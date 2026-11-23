@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Route Recall Lab</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#eef2f1;color:#192f31;font:16px system-ui}main{max-width:1160px;margin:auto;padding:24px 16px}
+header{background:#122e36;color:#fff;padding:30px;border-radius:14px}h1{margin:0;font-size:clamp(2rem,5vw,3.5rem);letter-spacing:-.05em}
+h2{font-size:1.2rem}h3{margin-top:0}p{line-height:1.55}section,article{background:#fff;border:1px solid #d3dfdd;border-radius:12px;padding:18px;margin-top:14px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(245px,1fr));gap:12px}button,select{font:inherit;border:1px solid #869c9b;border-radius:6px;padding:7px;background:#fff;color:inherit}button{background:#0d5c57;color:#fff;cursor:pointer}button:disabled{opacity:.5;cursor:default}.controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+canvas{width:100%;height:auto;background:#f3f6f6;border-radius:8px}.score{font-size:1.8rem;font-weight:700}.note{color:#405957}.error{color:#9b282a}.scroll{overflow:auto}table{border-collapse:collapse;width:100%}th,td{text-align:left;padding:8px;border-bottom:1px solid #dbe4e3}
+.help{position:relative;display:inline-flex;vertical-align:middle;margin-left:6px}
+.help button{background:#fff;color:#165852;border-radius:50%;width:23px;height:23px;padding:0;font-size:.85rem}
+.tooltip{display:none;position:absolute;top:100%;right:-32px;z-index:2;width:min(245px,70vw);padding:10px;border-radius:7px;background:#122e36;color:#fff;font-size:.83rem;font-weight:400;line-height:1.4}
+.help:hover .tooltip,.help:focus-within .tooltip{display:block}
+</style>
+<main>
+<header><h1>Route Recall Lab</h1><p>Compare how three decision methods use the same historical incidents. Always Direct provides the unassisted score.</p></header>
+<section>
+<div class="controls"><label>Incident <select id="scenario"></select></label><button id="run">Compare routes</button><button id="all">Run all incidents</button><button id="reset">Reset scores</button></div>
+<p id="report"></p><a href="#methods">How the methods work</a><p id="status" class="note" role="status"></p>
+</section>
+<div class="grid" id="policies"></div>
+<section><h2>Scores on the same completed incidents</h2><p id="coverage"></p><div class="scroll"><table id="totals"></table></div></section>
+<section><h2>Decision history</h2><div class="scroll"><table id="history"></table></div></section>
+<section><h2>Historical cases for the selected incident</h2><div class="scroll"><table id="cases"></table></div></section>
+<section id="methods"><h2>Methods guide</h2>
+<p>All policies use the same reward: +100 for an on-time arrival (within seven hours), +80 for late, or −50 for blocked, minus route cost. The historical profiles and the evaluation incidents are synthetic. The reported affected road records the main impact; notes can describe secondary delays or severity.</p>
+<div class="scroll"><table>
+<thead><tr><th>Method</th><th>How it works and why use it</th><th>Speed and compute</th><th>Typical failure</th></tr></thead>
+<tbody>
+<tr><th>Structured recall</th><td>Looks up cases on the same lane and category, prioritizes the same affected road, and ranks by historical reward. Useful for repeated incidents with dependable fields and an auditable precedent.</td><td>Local SQLite work on CPU. No GPU or provider call. Larger histories can benefit from an index on matching fields.</td><td>A high-scoring mild incident can outrank a severe precedent when the fields look identical.</td></tr>
+<tr><th>LLM-assisted recall</th><td>Reads the same candidate cases and compares the current narrative with historical notes. Useful when a report explains severity or a secondary disruption. The app verifies the cited case and route.</td><td>Local retrieval and request handling use CPU. Inference runs at the provider, so no local GPU is required. Network and model latency add to response time, and requests can incur token charges.</td><td>Ambiguous notes, missing cases, or a plausible but incorrect analogy can produce a poor route. Valid citations do not establish sound reasoning.</td></tr>
+<tr><th>Q-learning</th><td>Estimates a value for each route by averaging observed rewards through terminal Q-updates. It trains on balanced synthetic historical outcomes for every route, then selects the highest value from a frozen table. Useful for repeated decisions with measurable outcomes.</td><td>CPU-only tabular training. Lookup is local. Training work grows with observations, and memory grows with the number of state–action pairs.</td><td>Different severities can share one state, so its best average action can be poor for a specific dispatch. This one-step task does not test delayed rewards.</td></tr>
+<tr><th>Always Direct</th><td>Chooses the direct route every time. Useful as a fixed reference for the cost of ignoring disruptions.</td><td>Constant-time choice on CPU. No training, GPU, or provider call.</td><td>Cannot adjust when another road is more reliable or when Direct is blocked.</td></tr>
+</tbody></table></div>
+<p class="note">The resource comparisons describe the implementation. The app does not benchmark CPU, GPU, or latency.</p>
+</section>
+</main>
+<script>
+const el = id => document.getElementById(id);
+const keys = ['structured','llm','q_learning','direct'];
+const names = ['Structured recall','LLM-assisted recall','Q-learning','Always Direct'];
+const explanations = [
+  'Matches lane and category, prioritizes the affected road, then picks the highest historical reward.',
+  'Compares the current report with the same candidate case notes and cites the case behind its route choice.',
+  'Uses a frozen table of average historical route rewards for the current lane, category, and affected road.',
+  'Selects Direct on every dispatch without consulting past incidents.'
+];
+const colors = ['#087268','#225baa','#71529a','#784d26'];
+const results = new Map();
+let data, busy = false;
+function fillTable(id, headings, rows) {
+  const table = el(id);
+  table.replaceChildren();
+  const header = table.createTHead().insertRow();
+  headings.forEach(value => {
+    const th = document.createElement('th');
+    th.scope = 'col';
+    th.textContent = value;
+    header.append(th);
+  });
+  const body = table.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    row.forEach(value => tr.insertCell().textContent = value);
+  }
+}
+function draw(canvas, lane, choice, color) {
+  const ctx = canvas.getContext('2d');
+  ctx.font = '15px system-ui';
+  ctx.textAlign = 'center';
+  Object.keys(data.routes).forEach((name,i) => {
+    const y = 30 + i * 40;
+    const selected = name === choice?.route;
+    ctx.strokeStyle = selected ? color : '#a0b1b1';
+    ctx.lineWidth = selected ? 5 : 2;
+    ctx.setLineDash(selected && choice.outcome === 'Blocked' ? [6,4] : []);
+    ctx.beginPath();
+    ctx.moveTo(28,70);
+    ctx.lineTo(170,y);
+    ctx.lineTo(312,70);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#f3f6f6';
+    ctx.fillRect(102,y-13,136,26);
+    ctx.fillStyle = selected ? color : '#3d5657';
+    ctx.fillText(name + ' · ' + data.waypoints[name],170,y+5);
+  });
+  const [from,to] = lane.split(' → ');
+  [[28,from],[312,to]].forEach(([x,label]) => {
+    ctx.beginPath();
+    ctx.arc(x,70,15,0,2*Math.PI);
+    ctx.fillStyle = '#122e36';
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.fillText(label,x,75);
+  });
+}
+function render() {
+  const scenario = data.scenarios[Number(el('scenario').value)];
+  const result = results.get(scenario.id);
+  el('report').textContent = scenario.lane + ' · ' + scenario.category + ' · Affected road: ' + scenario.affected_road + ' · ' + scenario.report;
+  el('policies').replaceChildren(...keys.map((key,i) => {
+    const card = document.createElement('article');
+    const choice = result?.[key];
+    const heading = document.createElement('h3');
+    heading.textContent = names[i];
+    const help = document.createElement('span');
+    help.className = 'help';
+    const trigger = document.createElement('button');
+    trigger.type = 'button';
+    trigger.textContent = '?';
+    trigger.setAttribute('aria-label', 'How ' + names[i] + ' works');
+    trigger.setAttribute('aria-describedby', 'method-tip-' + key);
+    const tooltip = document.createElement('span');
+    tooltip.id = 'method-tip-' + key;
+    tooltip.className = 'tooltip';
+    tooltip.setAttribute('role', 'tooltip');
+    tooltip.textContent = explanations[i];
+    help.append(trigger, tooltip);
+    heading.append(help);
+    const canvas = document.createElement('canvas');
+    canvas.width = 340;
+    canvas.height = 140;
+    canvas.setAttribute('aria-label', choice ? scenario.lane + ' via ' + choice.route : 'Route options for ' + scenario.lane);
+    draw(canvas,scenario.lane,choice,colors[i]);
+    const score = document.createElement('p');
+    score.className = 'score';
+    score.textContent = choice ? choice.reward + ' points' : '—';
+    const detail = document.createElement('p');
+    detail.textContent = choice ? [choice.route + ' via ' + data.waypoints[choice.route],choice.outcome,
+      choice.hours === null ? null : choice.hours + ' h',choice.case_id].filter(Boolean).join(' · ') :
+      key === 'llm' ? (result?.llm_error || (data.llm_enabled ? 'Model: ' + data.model : 'API key required')) : 'Run this incident to score the policy.';
+    const reason = document.createElement('p');
+    reason.className = 'note';
+    reason.textContent = choice?.reason || '';
+    card.append(heading,canvas,score,detail,reason);
+    if (choice?.q_values) {
+      const values = document.createElement('p');
+      values.className = 'note';
+      values.textContent = 'Learned values: ' + Object.entries(choice.q_values).map(([action,value]) => action + ' ' + value).join(' · ');
+      card.append(values);
+    }
+    return card;
+  }));
+  const rows = [...results.values()];
+  const matched = rows.filter(r => r.llm);
+  el('coverage').textContent = rows.length + ' of ' + data.scenarios.length +
+    ' incidents scored. Full comparison uses the ' + matched.length + ' with all four results.';
+  fillTable('totals',['Policy','Available incidents','Total on available incidents','Total on matched incidents'], keys.map((key,i) => {
+    const available = rows.filter(r => r[key]);
+    const total = subset => subset.length ? subset.reduce((sum,r) => sum + r[key].reward,0) : '—';
+    return [names[i],available.length,total(available),total(matched)];
+  }));
+  const summary = result => result ? result.route+' · '+result.outcome+' · '+result.reward : '—';
+  fillTable('history',['Incident',...names],data.scenarios.filter(s=>results.has(s.id)).map(s=>{
+    const item=results.get(s.id);
+    return [s.lane+' · '+s.category,...keys.map(key=>summary(item[key]))];
+  }));
+  fillTable('cases',['Case','Affected road','Historical report','Route','Historical reward'],
+    (result?.cases || []).map(c=>[c.id,c.affected_road,c.note,c.route,c.reward]));
+}
+async function compare(ids) {
+  if (busy) return;
+  busy = true;
+  ['run','all','reset','scenario'].forEach(id => el(id).disabled = true);
+  try {
+    for (const id of ids) {
+      el('status').textContent = 'Scoring incident ' + (id+1) + '…';
+      const response = await fetch('/api/compare/'+id,{method:'POST'});
+      if (!response.ok) throw new Error('Request failed ('+response.status+').');
+      results.set(id, await response.json());
+      el('scenario').value = id;
+      render();
+    }
+    el('status').textContent = data.llm_enabled ?
+      'Completed. Check the LLM result on each incident.' : 'Completed in offline mode. LLM results are unscored.';
+  } catch (error) {
+    el('status').textContent = error.message;
+  } finally {
+    busy = false;
+    ['run','all','reset','scenario'].forEach(id => el(id).disabled = false);
+  }
+}
+async function start() {
+  try {
+    const response = await fetch('/api/scenarios');
+    if (!response.ok) throw new Error('Could not load incidents.');
+    data = await response.json();
+    data.scenarios.forEach(s=>el('scenario').add(new Option((s.id+1)+'. '+s.lane+' · '+s.category,s.id)));
+    el('scenario').onchange = render;
+    el('run').onclick = () => compare([Number(el('scenario').value)]);
+    el('all').onclick = () => compare(data.scenarios.map(s=>s.id));
+    el('reset').onclick = () => {results.clear();el('status').textContent='';render();};
+    render();
+  } catch(error) {el('status').textContent=error.message;}
+}
+start();
+</script>
+</html>
